@@ -273,8 +273,12 @@ func (w *S3StreamingWriter) flushIfNeeded(ctx context.Context) {
 	}
 
 	if time.Since(w.lastFlush) >= w.maxBufferPeriod && w.uploadBuffer.Len() > 0 {
-		// Force flush even if under 5MB threshold
-		w.forceFlush(ctx)
+		// Only force flush if we already have parts uploaded (continuation of multipart)
+		// OR if we have enough data for a valid S3 part (>= 5 MiB)
+		if len(w.completedParts) > 0 || w.uploadSize >= 5*1024*1024 {
+			w.forceFlush(ctx)
+		}
+		// Otherwise, let the data accumulate until Close()
 	}
 
 	// Reschedule timer
