@@ -453,6 +453,7 @@ func (h *httpPaginatedInput) ReadBatch(ctx context.Context) (service.MessageBatc
 						// Encode as JSON matching API cursor format
 						cursorJSON := fmt.Sprintf(`{"id": %q, "created_at": %q}`, idVal, createdAtVal)
 						h.pendingCursor = cursorJSON
+						h.log.With("cursor", cursorJSON, "page", h.currentPage).Info("Captured first_page cursor from first record")
 					}
 				}
 			}
