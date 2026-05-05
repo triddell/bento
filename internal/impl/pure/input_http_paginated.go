@@ -188,11 +188,12 @@ type httpPaginatedInput struct {
 	maxPages   int
 	maxRecords int
 
-	client      *http.Client
-	currentPage int
-	totalRecords int
-	buffer      []any
-	done        bool
+	client        *http.Client
+	currentPage   int
+	totalRecords  int
+	buffer        []any
+	done          bool
+	pendingCursor string // Cursor to save after current page is fully consumed
 
 	log *service.Logger
 }
@@ -425,6 +426,11 @@ func (h *httpPaginatedInput) ReadBatch(ctx context.Context) (service.MessageBatc
 		h.done = true
 	}
 
+	// Store cursor to save after this page is fully consumed
+	if nextCursor != "" {
+		h.pendingCursor = nextCursor
+	}
+
 	// Buffer records
 	if h.flatten {
 		h.buffer = records
@@ -477,12 +483,14 @@ func (h *httpPaginatedInput) emitFromBuffer() (service.MessageBatch, service.Ack
 		}
 
 		// Message successfully processed
-		// If buffer is now empty and we fetched the last message of a page, save checkpoint
-		if len(h.buffer) == 0 && h.paginator.currentCursor != "" {
-			if err := h.checkpoint.Save(h.paginator.currentCursor); err != nil {
+		// Save checkpoint once when page is fully consumed (buffer empty and we have a pending cursor)
+		if len(h.buffer) == 0 && h.pendingCursor != "" {
+			if err := h.checkpoint.Save(h.pendingCursor); err != nil {
 				h.log.With("error", err).Warn("Failed to save checkpoint")
 				// Don't fail the ack, just log
 			}
+			// Clear pending cursor after saving
+			h.pendingCursor = ""
 		}
 
 		return nil
