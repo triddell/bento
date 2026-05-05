@@ -443,35 +443,20 @@ func (h *httpPaginatedInput) ReadBatch(ctx context.Context) (service.MessageBatc
 	// Store cursor to save after this page is fully consumed
 	// Strategy determines which cursor to save to checkpoint
 	if h.checkpointStrategy == "first_page" {
-		// For APIs that return newest-first: save the first record's cursor from page 1
-		// This ensures we resume from the newest record seen, not the oldest on page 1
-		if h.currentPage == 1 && len(records) > 0 {
-			// Extract cursor from first record (newest)
-			if firstRecord, ok := records[0].(map[string]any); ok {
-				if idVal, exists := firstRecord["id"]; exists {
-					if createdAtVal, exists := firstRecord["created_at"]; exists {
-						// Encode as JSON matching API cursor format
-						cursorJSON := fmt.Sprintf(`{"id": %q, "created_at": %q}`, idVal, createdAtVal)
-						h.pendingCursor = cursorJSON
-					}
+		// For APIs that return newest-first: save first_id from page 1
+		// Use the API's cursor value, not extracted from records
+		if h.currentPage == 1 {
+			// Read first_id from API response (opposite of next_cursor_field)
+			if firstID, ok := respData["first_id"]; ok {
+				if firstIDStr, isStr := firstID.(string); isStr {
+					h.pendingCursor = firstIDStr
 				}
 			}
 		}
 		// Otherwise pendingCursor stays as-is (from first page)
 	} else {
-		// For APIs that return oldest-first: save the last record's cursor from last page
-		// Use last record of current page
-		if len(records) > 0 {
-			if lastRecord, ok := records[len(records)-1].(map[string]any); ok {
-				if idVal, exists := lastRecord["id"]; exists {
-					if createdAtVal, exists := lastRecord["created_at"]; exists {
-						// Encode as JSON matching API cursor format
-						cursorJSON := fmt.Sprintf(`{"id": %q, "created_at": %q}`, idVal, createdAtVal)
-						h.pendingCursor = cursorJSON
-					}
-				}
-			}
-		}
+		// For APIs that return oldest-first: always update to latest cursor
+		h.pendingCursor = nextCursor
 	}
 
 	// Buffer records
