@@ -32,8 +32,9 @@ const (
 	hipResponseDataField = "data_field"
 	hipResponseFlatten   = "flatten"
 
-	hipCheckpointCache = "cache"
-	hipCheckpointKey   = "key"
+	hipCheckpointCache    = "cache"
+	hipCheckpointKey      = "key"
+	hipCheckpointStrategy = "save_strategy"
 )
 
 func httpPaginatedInputSpec() *service.ConfigSpec {
@@ -145,6 +146,11 @@ output:
 
 				service.NewStringField("key").
 					Description("Cache key for storing the checkpoint cursor. Supports environment variable expansion."),
+
+				service.NewStringEnumField("save_strategy", "first_page", "last_page").
+					Description("Which cursor to save: 'first_page' (for APIs returning newest-first) or 'last_page' (for APIs returning oldest-first). Default: 'last_page'.").
+					Default("last_page").
+					Advanced(),
 			).Description("Checkpoint configuration for resumability. Requires a cache resource.").
 				Optional(),
 
@@ -181,6 +187,7 @@ type httpPaginatedInput struct {
 
 	paginator  *cursorPaginator
 	checkpoint checkpointer
+	checkpointStrategy string // "first_page" or "last_page"
 
 	dataField string
 	flatten   bool
@@ -266,6 +273,7 @@ func newHTTPPaginatedInputFromParsed(conf *service.ParsedConfig, mgr *service.Re
 
 	// Checkpoint config
 	var checkpoint checkpointer
+	checkpointStrategy := "last_page" // Default
 	if conf.Contains(hipFieldCheckpoint) {
 		cacheName, err := conf.FieldString(hipFieldCheckpoint, hipCheckpointCache)
 		if err != nil {
@@ -275,6 +283,11 @@ func newHTTPPaginatedInputFromParsed(conf *service.ParsedConfig, mgr *service.Re
 		cacheKey, err := conf.FieldString(hipFieldCheckpoint, hipCheckpointKey)
 		if err != nil {
 			return nil, fmt.Errorf("checkpoint key field required: %w", err)
+		}
+
+		strategy, err := conf.FieldString(hipFieldCheckpoint, hipCheckpointStrategy)
+		if err == nil {
+			checkpointStrategy = strategy
 		}
 
 		checkpoint = &cacheCheckpointer{
@@ -311,6 +324,7 @@ func newHTTPPaginatedInputFromParsed(conf *service.ParsedConfig, mgr *service.Re
 			currentCursor:   initialCursor,
 		},
 		checkpoint:   checkpoint,
+		checkpointStrategy: checkpointStrategy,
 		dataField:    dataField,
 		flatten:      flatten,
 		maxPages:     maxPages,
@@ -427,8 +441,18 @@ func (h *httpPaginatedInput) ReadBatch(ctx context.Context) (service.MessageBatc
 	}
 
 	// Store cursor to save after this page is fully consumed
-	// Always save the current cursor (from this page's response) so we can resume after it
-	h.pendingCursor = h.paginator.currentCursor
+	// Strategy determines which cursor to save to checkpoint
+	if h.checkpointStrategy == "first_page" {
+		// For APIs that return newest-first: only save cursor from first page
+		// But pagination still advances through all pages
+		if h.currentPage == 1 {
+			h.pendingCursor = h.paginator.currentCursor
+		}
+		// Otherwise pendingCursor stays as-is (from first page)
+	} else {
+		// For APIs that return oldest-first (default): always update to latest cursor
+		h.pendingCursor = h.paginator.currentCursor
+	}
 
 	// Buffer records
 	if h.flatten {
