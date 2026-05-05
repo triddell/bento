@@ -475,16 +475,19 @@ func (h *httpPaginatedInput) emitFromBuffer() (service.MessageBatch, service.Ack
 		batch = append(batch, msg)
 	}
 
+	// Capture state at closure creation time: is this the last message from the current page?
+	isLastMessageOfPage := len(h.buffer) == 0 && h.pendingCursor != ""
+	pendingCursorToSave := h.pendingCursor
+
 	ackFn := func(ctx context.Context, err error) error {
 		if err != nil {
 			// Message failed - don't update checkpoint
 			return nil
 		}
 
-		// Message successfully processed
-		// Save checkpoint once when page is fully consumed (buffer empty and we have a pending cursor)
-		if len(h.buffer) == 0 && h.pendingCursor != "" {
-			if err := h.checkpoint.Save(h.pendingCursor); err != nil {
+		// Save checkpoint once when this was the last message of a page
+		if isLastMessageOfPage {
+			if err := h.checkpoint.Save(pendingCursorToSave); err != nil {
 				h.log.With("error", err).Warn("Failed to save checkpoint")
 				// Don't fail the ack, just log
 			}
