@@ -427,9 +427,8 @@ func (h *httpPaginatedInput) ReadBatch(ctx context.Context) (service.MessageBatc
 	}
 
 	// Store cursor to save after this page is fully consumed
-	if nextCursor != "" {
-		h.pendingCursor = nextCursor
-	}
+	// Always save the current cursor (from this page's response) so we can resume after it
+	h.pendingCursor = h.paginator.currentCursor
 
 	// Buffer records
 	if h.flatten {
