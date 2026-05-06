@@ -443,15 +443,9 @@ func (h *httpPaginatedInput) ReadBatch(ctx context.Context) (service.MessageBatc
 	// Store cursor to save after this page is fully consumed
 	// Strategy determines which cursor to save to checkpoint
 	if h.checkpointStrategy == "first_page" {
-		// For APIs that return newest-first: save first_id from page 1
-		// Use the API's cursor value, not extracted from records
+		// For APIs that return newest-first: save cursor from page 1
 		if h.currentPage == 1 {
-			// Read first_id from API response (opposite of next_cursor_field)
-			if firstID, ok := respData["first_id"]; ok {
-				if firstIDStr, isStr := firstID.(string); isStr {
-					h.pendingCursor = firstIDStr
-				}
-			}
+			h.pendingCursor = nextCursor
 		}
 		// Otherwise pendingCursor stays as-is (from first page)
 	} else {
