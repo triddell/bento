@@ -1,10 +1,10 @@
-package pure
+package io
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
+	goio "io"
 	"net/http"
 	"time"
 
@@ -392,11 +392,11 @@ func (h *httpPaginatedInput) ReadBatch(ctx context.Context) (service.MessageBatc
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes, _ := goio.ReadAll(resp.Body)
 		return nil, nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
-	bodyBytes, err := io.ReadAll(resp.Body)
+	bodyBytes, err := goio.ReadAll(resp.Body)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to read response body: %w", err)
 	}
