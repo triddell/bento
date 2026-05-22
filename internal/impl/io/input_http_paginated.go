@@ -29,6 +29,15 @@ const (
 	hipCursorHasMoreField     = "has_more_field"
 	hipCursorInitial          = "initial_cursor"
 
+	hipPaginationTimeWindow   = "time_window"
+	hipTimeWindowStartParam   = "start_param"
+	hipTimeWindowEndParam     = "end_param"
+	hipTimeWindowFormat       = "format"
+	hipTimeWindowSize         = "window_size"
+	hipTimeWindowLag          = "lag"
+	hipTimeWindowInitial      = "initial_window"
+	hipTimeWindowCursor       = "cursor"
+
 	hipResponseDataField = "data_field"
 	hipResponseFlatten   = "flatten"
 
@@ -105,8 +114,8 @@ output:
 				Default("30s"),
 
 			service.NewObjectField(hipFieldPagination,
-				service.NewStringEnumField(hipPaginationType, "cursor").
-					Description("Pagination strategy type.").
+				service.NewStringEnumField(hipPaginationType, "cursor", "time_window").
+					Description("Pagination strategy type: 'cursor' for cursor-based APIs, 'time_window' for time-range based APIs with optional cursor pagination within windows.").
 					Default("cursor"),
 
 				service.NewObjectField(hipPaginationCursor,
@@ -126,7 +135,50 @@ output:
 					service.NewStringField(hipCursorInitial).
 						Description("Initial cursor value to start from. Empty string means start from the beginning.").
 						Default(""),
-				).Description("Cursor-based pagination configuration.").
+				).Description("Cursor-based pagination configuration. Required when type is 'cursor'.").
+					Optional(),
+
+				service.NewObjectField(hipPaginationTimeWindow,
+					service.NewStringField(hipTimeWindowStartParam).
+						Description("Query parameter name for window start time (e.g., 'created_at.gte', 'since', 'start_time').").
+						Default("created_at.gte"),
+
+					service.NewStringField(hipTimeWindowEndParam).
+						Description("Query parameter name for window end time (e.g., 'created_at.lt', 'until', 'end_time').").
+						Default("created_at.lt"),
+
+					service.NewStringField(hipTimeWindowFormat).
+						Description("Go time format string for formatting timestamps in URL (e.g., '2006-01-02T15:04:05Z07:00' for RFC3339).").
+						Default("2006-01-02T15:04:05Z07:00"),
+
+					service.NewDurationField(hipTimeWindowSize).
+						Description("Size of each time window to process (e.g., '2m', '5m', '1h').").
+						Default("2m"),
+
+					service.NewDurationField(hipTimeWindowLag).
+						Description("Lag buffer - how far behind current time to process (e.g., '2m' means process up to 2 minutes ago). This allows time for events to be indexed by the API.").
+						Default("2m"),
+
+					service.NewDurationField(hipTimeWindowInitial).
+						Description("If no checkpoint exists, how far back to start from current time (e.g., '-1h' for 1 hour ago). Negative durations go backwards in time.").
+						Default("-1h"),
+
+					service.NewObjectField(hipTimeWindowCursor,
+						service.NewStringField(hipCursorParamName).
+							Description("Query parameter name for the cursor (e.g., 'after_id').").
+							Default("after_id"),
+
+						service.NewStringField(hipCursorNextField).
+							Description("JSON path to the next cursor value in the response (e.g., 'last_id').").
+							Default("last_id"),
+
+						service.NewStringField(hipCursorHasMoreField).
+							Description("JSON path to a boolean indicating if more pages exist (optional).").
+							Default("has_more").
+							Optional(),
+					).Description("Optional cursor pagination within each time window. Useful when a single window may contain more records than the page size limit.").
+						Optional(),
+				).Description("Time window pagination configuration. Required when type is 'time_window'. Enables parallel processing by reserving time windows in the checkpoint.").
 					Optional(),
 			).Description("Pagination configuration."),
 
@@ -179,14 +231,20 @@ func init() {
 
 //------------------------------------------------------------------------------
 
+type paginator interface {
+	nextURL() string
+	update(respData map[string]any) (hasMore bool, nextCursor string, err error)
+}
+
 type httpPaginatedInput struct {
 	url     string
 	headers map[string]string
 	verb    string
 	timeout time.Duration
 
-	paginator  *cursorPaginator
-	checkpoint checkpointer
+	paginator          paginator
+	timeWindowPag      *timeWindowPaginator // Set only for time_window type
+	checkpoint         checkpointer
 	checkpointStrategy string // "first_page" or "last_page"
 
 	dataField string
@@ -232,32 +290,116 @@ func newHTTPPaginatedInputFromParsed(conf *service.ParsedConfig, mgr *service.Re
 		return nil, err
 	}
 
-	if paginationType != "cursor" {
-		return nil, fmt.Errorf("pagination type %q not yet implemented (only 'cursor' supported)", paginationType)
-	}
+	var pag paginator
+	var timeWindowPag *timeWindowPaginator
 
-	// Cursor pagination config
-	cursorParamName, err := conf.FieldString(hipFieldPagination, hipPaginationCursor, hipCursorParamName)
-	if err != nil {
-		return nil, err
-	}
-
-	nextCursorField, err := conf.FieldString(hipFieldPagination, hipPaginationCursor, hipCursorNextField)
-	if err != nil {
-		return nil, err
-	}
-
-	hasMoreField := ""
-	if conf.Contains(hipFieldPagination, hipPaginationCursor, hipCursorHasMoreField) {
-		hasMoreField, err = conf.FieldString(hipFieldPagination, hipPaginationCursor, hipCursorHasMoreField)
+	switch paginationType {
+	case "cursor":
+		// Cursor pagination config
+		cursorParamName, err := conf.FieldString(hipFieldPagination, hipPaginationCursor, hipCursorParamName)
 		if err != nil {
 			return nil, err
 		}
-	}
 
-	initialCursor, err := conf.FieldString(hipFieldPagination, hipPaginationCursor, hipCursorInitial)
-	if err != nil {
-		return nil, err
+		nextCursorField, err := conf.FieldString(hipFieldPagination, hipPaginationCursor, hipCursorNextField)
+		if err != nil {
+			return nil, err
+		}
+
+		hasMoreField := ""
+		if conf.Contains(hipFieldPagination, hipPaginationCursor, hipCursorHasMoreField) {
+			hasMoreField, err = conf.FieldString(hipFieldPagination, hipPaginationCursor, hipCursorHasMoreField)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		initialCursor, err := conf.FieldString(hipFieldPagination, hipPaginationCursor, hipCursorInitial)
+		if err != nil {
+			return nil, err
+		}
+
+		pag = &cursorPaginator{
+			baseURL:         url,
+			cursorParamName: cursorParamName,
+			nextCursorField: nextCursorField,
+			hasMoreField:    hasMoreField,
+			currentCursor:   initialCursor,
+		}
+
+	case "time_window":
+		// Time window pagination config
+		startParam, err := conf.FieldString(hipFieldPagination, hipPaginationTimeWindow, hipTimeWindowStartParam)
+		if err != nil {
+			return nil, err
+		}
+
+		endParam, err := conf.FieldString(hipFieldPagination, hipPaginationTimeWindow, hipTimeWindowEndParam)
+		if err != nil {
+			return nil, err
+		}
+
+		format, err := conf.FieldString(hipFieldPagination, hipPaginationTimeWindow, hipTimeWindowFormat)
+		if err != nil {
+			return nil, err
+		}
+
+		windowSize, err := conf.FieldDuration(hipFieldPagination, hipPaginationTimeWindow, hipTimeWindowSize)
+		if err != nil {
+			return nil, err
+		}
+
+		lag, err := conf.FieldDuration(hipFieldPagination, hipPaginationTimeWindow, hipTimeWindowLag)
+		if err != nil {
+			return nil, err
+		}
+
+		initialWindow, err := conf.FieldDuration(hipFieldPagination, hipPaginationTimeWindow, hipTimeWindowInitial)
+		if err != nil {
+			return nil, err
+		}
+
+		twPag := &timeWindowPaginator{
+			baseURL:       url,
+			startParam:    startParam,
+			endParam:      endParam,
+			format:        format,
+			windowSize:    windowSize,
+			lag:           lag,
+			initialWindow: initialWindow,
+		}
+
+		// Check if cursor pagination within windows is configured
+		if conf.Contains(hipFieldPagination, hipPaginationTimeWindow, hipTimeWindowCursor) {
+			cursorParamName, err := conf.FieldString(hipFieldPagination, hipPaginationTimeWindow, hipTimeWindowCursor, hipCursorParamName)
+			if err != nil {
+				return nil, err
+			}
+
+			nextCursorField, err := conf.FieldString(hipFieldPagination, hipPaginationTimeWindow, hipTimeWindowCursor, hipCursorNextField)
+			if err != nil {
+				return nil, err
+			}
+
+			hasMoreField := ""
+			if conf.Contains(hipFieldPagination, hipPaginationTimeWindow, hipTimeWindowCursor, hipCursorHasMoreField) {
+				hasMoreField, err = conf.FieldString(hipFieldPagination, hipPaginationTimeWindow, hipTimeWindowCursor, hipCursorHasMoreField)
+				if err != nil {
+					return nil, err
+				}
+			}
+
+			twPag.hasCursor = true
+			twPag.cursorParamName = cursorParamName
+			twPag.nextCursorField = nextCursorField
+			twPag.hasMoreField = hasMoreField
+		}
+
+		pag = twPag
+		timeWindowPag = twPag
+
+	default:
+		return nil, fmt.Errorf("pagination type %q not supported", paginationType)
 	}
 
 	// Response config
@@ -312,37 +454,61 @@ func newHTTPPaginatedInputFromParsed(conf *service.ParsedConfig, mgr *service.Re
 	}
 
 	return &httpPaginatedInput{
-		url:     url,
-		headers: headers,
-		verb:    verb,
-		timeout: timeout,
-		paginator: &cursorPaginator{
-			baseURL:         url,
-			cursorParamName: cursorParamName,
-			nextCursorField: nextCursorField,
-			hasMoreField:    hasMoreField,
-			currentCursor:   initialCursor,
-		},
-		checkpoint:   checkpoint,
+		url:                url,
+		headers:            headers,
+		verb:               verb,
+		timeout:            timeout,
+		paginator:          pag,
+		timeWindowPag:      timeWindowPag,
+		checkpoint:         checkpoint,
 		checkpointStrategy: checkpointStrategy,
-		dataField:    dataField,
-		flatten:      flatten,
-		maxPages:     maxPages,
-		maxRecords:   maxRecords,
-		client:       &http.Client{Timeout: timeout},
-		buffer:       []any{},
-		log:          mgr.Logger(),
+		dataField:          dataField,
+		flatten:            flatten,
+		maxPages:           maxPages,
+		maxRecords:         maxRecords,
+		client:             &http.Client{Timeout: timeout},
+		buffer:             []any{},
+		log:                mgr.Logger(),
 	}, nil
 }
 
 func (h *httpPaginatedInput) Connect(ctx context.Context) error {
 	// Load checkpoint to resume from last position
-	cursor, err := h.checkpoint.Load()
+	checkpointValue, err := h.checkpoint.Load()
 	if err != nil {
 		h.log.With("error", err).Warn("Failed to load checkpoint, starting from beginning")
-	} else if cursor != "" {
-		h.paginator.currentCursor = cursor
-		h.log.With("cursor", cursor).Info("Resuming from checkpoint")
+	}
+
+	if h.timeWindowPag != nil {
+		// Time window pagination - initialize window from checkpoint
+		if err := h.timeWindowPag.initializeWindow(checkpointValue); err != nil {
+			return fmt.Errorf("failed to initialize time window: %w", err)
+		}
+
+		// Check if already caught up (no window to process)
+		if h.timeWindowPag.isDone() {
+			h.log.Info("Already caught up to current time, no data to fetch")
+			h.done = true
+		} else {
+			h.log.With(
+				"window_start", h.timeWindowPag.windowStart.Format(time.RFC3339),
+				"window_end", h.timeWindowPag.windowEnd.Format(time.RFC3339),
+			).Info("Processing time window")
+		}
+
+		// Save new checkpoint BEFORE fetching (window reservation)
+		newCheckpoint := h.timeWindowPag.getCheckpoint()
+		if err := h.checkpoint.Save(newCheckpoint); err != nil {
+			h.log.With("error", err).Warn("Failed to save initial checkpoint")
+		} else {
+			h.log.With("checkpoint", newCheckpoint).Info("Reserved time window")
+		}
+	} else if cursorPag, ok := h.paginator.(*cursorPaginator); ok {
+		// Cursor pagination - set initial cursor
+		if checkpointValue != "" {
+			cursorPag.currentCursor = checkpointValue
+			h.log.With("cursor", checkpointValue).Info("Resuming from checkpoint")
+		}
 	}
 
 	return nil
@@ -440,17 +606,20 @@ func (h *httpPaginatedInput) ReadBatch(ctx context.Context) (service.MessageBatc
 		h.done = true
 	}
 
-	// Store cursor to save after this page is fully consumed
-	// Strategy determines which cursor to save to checkpoint
-	if h.checkpointStrategy == "first_page" {
-		// For APIs that return newest-first: save cursor from page 1
-		if h.currentPage == 1 {
+	// Store cursor to save after this page is fully consumed (only for cursor pagination)
+	// For time windows, checkpoint is already saved at the beginning (window reservation)
+	if h.timeWindowPag == nil {
+		// Pure cursor pagination - save cursor based on strategy
+		if h.checkpointStrategy == "first_page" {
+			// For APIs that return newest-first: save cursor from page 1
+			if h.currentPage == 1 {
+				h.pendingCursor = nextCursor
+			}
+			// Otherwise pendingCursor stays as-is (from first page)
+		} else {
+			// For APIs that return oldest-first: always update to latest cursor
 			h.pendingCursor = nextCursor
 		}
-		// Otherwise pendingCursor stays as-is (from first page)
-	} else {
-		// For APIs that return oldest-first: always update to latest cursor
-		h.pendingCursor = nextCursor
 	}
 
 	// Buffer records
@@ -579,6 +748,109 @@ func containsMiddle(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+//------------------------------------------------------------------------------
+
+type timeWindowPaginator struct {
+	baseURL       string
+	startParam    string
+	endParam      string
+	format        string
+	windowSize    time.Duration
+	lag           time.Duration
+	initialWindow time.Duration
+
+	// Window state
+	windowStart time.Time
+	windowEnd   time.Time
+
+	// Optional cursor pagination within windows
+	hasCursor       bool
+	cursorParamName string
+	nextCursorField string
+	hasMoreField    string
+	currentCursor   string
+}
+
+func (p *timeWindowPaginator) initializeWindow(checkpointTime string) error {
+	if checkpointTime != "" {
+		// Parse checkpoint as timestamp
+		t, err := time.Parse(p.format, checkpointTime)
+		if err != nil {
+			return fmt.Errorf("failed to parse checkpoint timestamp %q: %w", checkpointTime, err)
+		}
+		p.windowStart = t
+	} else {
+		// No checkpoint - use initial window (e.g., -1h from current time)
+		p.windowStart = time.Now().UTC().Add(p.initialWindow)
+	}
+
+	// Calculate window end: current time minus lag
+	p.windowEnd = time.Now().UTC().Add(-p.lag)
+
+	// Clamp window end to windowStart + windowSize to avoid too large windows
+	maxWindowEnd := p.windowStart.Add(p.windowSize)
+	if p.windowEnd.After(maxWindowEnd) {
+		p.windowEnd = maxWindowEnd
+	}
+
+	return nil
+}
+
+func (p *timeWindowPaginator) nextURL() string {
+	// Build URL with time window parameters
+	separator := "?"
+	if contains(p.baseURL, "?") {
+		separator = "&"
+	}
+
+	url := fmt.Sprintf("%s%s%s=%s&%s=%s",
+		p.baseURL,
+		separator,
+		p.startParam, p.windowStart.Format(p.format),
+		p.endParam, p.windowEnd.Format(p.format))
+
+	// Add cursor if we have one
+	if p.hasCursor && p.currentCursor != "" {
+		url = fmt.Sprintf("%s&%s=%s", url, p.cursorParamName, p.currentCursor)
+	}
+
+	return url
+}
+
+func (p *timeWindowPaginator) update(respData map[string]any) (hasMore bool, nextCursor string, err error) {
+	if !p.hasCursor {
+		// No cursor pagination - single page per window
+		return false, "", nil
+	}
+
+	// Extract next cursor for pagination within window
+	nextCursor, _ = respData[p.nextCursorField].(string)
+
+	// Check has_more if field is specified
+	if p.hasMoreField != "" {
+		hasMoreRaw, ok := respData[p.hasMoreField]
+		if ok {
+			hasMore, _ = hasMoreRaw.(bool)
+		}
+	} else {
+		// If no has_more field, assume more pages if we got a next cursor
+		hasMore = nextCursor != ""
+	}
+
+	p.currentCursor = nextCursor
+	return hasMore, nextCursor, nil
+}
+
+func (p *timeWindowPaginator) getCheckpoint() string {
+	// Return window end as the checkpoint (next window will start from here)
+	return p.windowEnd.Format(p.format)
+}
+
+func (p *timeWindowPaginator) isDone() bool {
+	// Done if window start >= window end (caught up to current time minus lag)
+	return !p.windowStart.Before(p.windowEnd)
 }
 
 //------------------------------------------------------------------------------
