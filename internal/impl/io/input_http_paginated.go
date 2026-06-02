@@ -113,6 +113,26 @@ output:
 				Description("Request timeout.").
 				Default("30s"),
 
+			service.NewDurationField("retry_period").
+				Description("The base period to wait between failed requests.").
+				Advanced().
+				Default("1s"),
+
+			service.NewDurationField("max_retry_backoff").
+				Description("The maximum period to wait between failed requests.").
+				Advanced().
+				Default("300s"),
+
+			service.NewIntField("retries").
+				Description("The maximum number of retry attempts to make.").
+				Advanced().
+				Default(3),
+
+			service.NewIntListField("backoff_on").
+				Description("A list of status codes whereby the request should be considered to have failed and retries should be attempted, but the period between them should be increased gradually.").
+				Advanced().
+				Default([]any{429, 500, 502, 503, 504}),
+
 			service.NewObjectField(hipFieldPagination,
 				service.NewStringEnumField(hipPaginationType, "cursor", "time_window").
 					Description("Pagination strategy type: 'cursor' for cursor-based APIs, 'time_window' for time-range based APIs with optional cursor pagination within windows.").
@@ -253,12 +273,16 @@ type httpPaginatedInput struct {
 	maxPages   int
 	maxRecords int
 
-	client        *http.Client
-	currentPage   int
-	totalRecords  int
-	buffer        []any
-	done          bool
-	pendingCursor string // Cursor to save after current page is fully consumed
+	client            *http.Client
+	retryPeriod       time.Duration
+	maxRetryBackoff   time.Duration
+	numRetries        int
+	backoffOn         map[int]struct{}
+	currentPage       int
+	totalRecords      int
+	buffer            []any
+	done              bool
+	pendingCursor     string // Cursor to save after current page is fully consumed
 
 	log *service.Logger
 }
@@ -453,6 +477,33 @@ func newHTTPPaginatedInputFromParsed(conf *service.ParsedConfig, mgr *service.Re
 		return nil, err
 	}
 
+	// HTTP client with retry configuration
+	retryPeriod, err := conf.FieldDuration("retry_period")
+	if err != nil {
+		return nil, err
+	}
+
+	maxRetryBackoff, err := conf.FieldDuration("max_retry_backoff")
+	if err != nil {
+		return nil, err
+	}
+
+	retries, err := conf.FieldInt("retries")
+	if err != nil {
+		return nil, err
+	}
+
+	backoffOnList, err := conf.FieldIntList("backoff_on")
+	if err != nil {
+		return nil, err
+	}
+
+	// Build backoff_on map for fast lookup
+	backoffOn := make(map[int]struct{}, len(backoffOnList))
+	for _, code := range backoffOnList {
+		backoffOn[code] = struct{}{}
+	}
+
 	return &httpPaginatedInput{
 		url:                url,
 		headers:            headers,
@@ -467,6 +518,10 @@ func newHTTPPaginatedInputFromParsed(conf *service.ParsedConfig, mgr *service.Re
 		maxPages:           maxPages,
 		maxRecords:         maxRecords,
 		client:             &http.Client{Timeout: timeout},
+		retryPeriod:        retryPeriod,
+		maxRetryBackoff:    maxRetryBackoff,
+		numRetries:         retries,
+		backoffOn:          backoffOn,
 		buffer:             []any{},
 		log:                mgr.Logger(),
 	}, nil
@@ -551,18 +606,70 @@ func (h *httpPaginatedInput) ReadBatch(ctx context.Context) (service.MessageBatc
 		req.Header.Set(k, v)
 	}
 
-	resp, err := h.client.Do(req)
-	if err != nil {
-		return nil, nil, fmt.Errorf("HTTP request failed: %w", err)
+	// Retry loop with exponential backoff
+	var resp *http.Response
+	var bodyBytes []byte
+	retryDelay := h.retryPeriod
+
+	for attempt := 0; attempt <= h.numRetries; attempt++ {
+		if attempt > 0 {
+			// Wait before retry
+			h.log.With("attempt", attempt, "delay", retryDelay, "url", url).Info("Retrying HTTP request")
+			select {
+			case <-time.After(retryDelay):
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			}
+
+			// Exponential backoff
+			retryDelay *= 2
+			if retryDelay > h.maxRetryBackoff {
+				retryDelay = h.maxRetryBackoff
+			}
+
+			// Recreate request for retry
+			req, err = http.NewRequestWithContext(ctx, h.verb, url, nil)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to create retry request: %w", err)
+			}
+			for k, v := range h.headers {
+				req.Header.Set(k, v)
+			}
+		}
+
+		resp, err = h.client.Do(req)
+		if err != nil {
+			// Network error - retry if attempts remaining
+			if attempt < h.numRetries {
+				h.log.With("error", err, "attempt", attempt+1).Warn("HTTP request failed, will retry")
+				continue
+			}
+			return nil, nil, fmt.Errorf("HTTP request failed after %d attempts: %w", attempt+1, err)
+		}
+
+		// Check status code
+		if resp.StatusCode == http.StatusOK {
+			// Success!
+			break
+		}
+
+		// Check if this status code should trigger backoff retry
+		_, shouldRetry := h.backoffOn[resp.StatusCode]
+		if !shouldRetry || attempt >= h.numRetries {
+			// Non-retryable error or out of retries
+			bodyBytes, _ = goio.ReadAll(resp.Body)
+			resp.Body.Close()
+			return nil, nil, fmt.Errorf("HTTP %d after %d attempts: %s", resp.StatusCode, attempt+1, string(bodyBytes))
+		}
+
+		// Retryable status code - close body and retry
+		h.log.With("status", resp.StatusCode, "attempt", attempt+1).Warn("HTTP request returned retryable status, will retry")
+		resp.Body.Close()
 	}
+
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := goio.ReadAll(resp.Body)
-		return nil, nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	bodyBytes, err := goio.ReadAll(resp.Body)
+	bodyBytes, err = goio.ReadAll(resp.Body)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to read response body: %w", err)
 	}
