@@ -149,8 +149,7 @@ output:
 						Default("last_id"),
 
 					service.NewStringField(hipCursorHasMoreField).
-						Description("Dot-separated path to a boolean indicating if more pages exist (optional). If unset, pagination continues while next_cursor_field resolves to a non-empty value and stops once it's absent or empty — correct for APIs (e.g. Airtable) with no explicit has-more flag.").
-						Default("has_more").
+						Description("Dot-separated path to a boolean indicating if more pages exist. Leave unset (no default) if the API has no such field — pagination will then continue while next_cursor_field resolves to a non-empty value and stop once it's absent or empty, correct for APIs (e.g. Airtable) with no explicit has-more flag. A default here would make an explicitly-set 'has_more' indistinguishable from an omitted field, defeating that fallback.").
 						Optional(),
 
 					service.NewStringField(hipCursorInitial).
@@ -194,8 +193,7 @@ output:
 							Default("last_id"),
 
 						service.NewStringField(hipCursorHasMoreField).
-							Description("Dot-separated path to a boolean indicating if more pages exist (optional). If unset, pagination continues while next_cursor_field resolves to a non-empty value.").
-							Default("has_more").
+							Description("Dot-separated path to a boolean indicating if more pages exist. Leave unset (no default) if the API has no such field — see the equivalent field under pagination.cursor for details.").
 							Optional(),
 					).Description("Optional cursor pagination within each time window. Useful when a single window may contain more records than the page size limit.").
 						Optional(),

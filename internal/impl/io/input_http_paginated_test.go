@@ -445,3 +445,32 @@ func TestCursorPaginatorUpdate_NestedFieldNoHasMore(t *testing.T) {
 	assert.False(t, hasMore, "must terminate when the nested cursor is absent")
 	assert.Equal(t, "", cursor)
 }
+
+// TestHasMoreFieldOmittedNotDefaulted reproduces a second, independent bug found
+// during real-world Airtable testing: has_more_field previously declared
+// Default("has_more"), so Contains() returned true even when a config (correctly,
+// per the Airtable case) never set it at all - making newHTTPPaginatedInputFromParsed
+// always resolve hasMoreField to "has_more" and look for a top-level key that Airtable's
+// response never has, terminating after page 1 regardless of whether the cursor itself
+// resolved. has_more_field must have no default: Contains() has to be able to tell
+// "the user omitted this" apart from "the user set it to has_more".
+func TestHasMoreFieldOmittedNotDefaulted(t *testing.T) {
+	config := `
+url: https://api.example.com/data
+pagination:
+  type: cursor
+  cursor:
+    param_name: next
+    next_cursor_field: pagination.next
+response:
+  data_field: events
+`
+	spec := httpPaginatedInputSpec()
+	env := service.NewEnvironment()
+
+	parsed, err := spec.ParseYAML(config, env)
+	require.NoError(t, err)
+
+	assert.False(t, parsed.Contains("pagination", "cursor", "has_more_field"),
+		"has_more_field must not appear to be set when the config never mentions it")
+}
