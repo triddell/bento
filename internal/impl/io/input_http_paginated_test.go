@@ -343,3 +343,105 @@ response:
 	// This is testing that the config can be parsed, even if invalid
 	assert.NotNil(t, parsed)
 }
+
+func TestExtractPath(t *testing.T) {
+	tests := []struct {
+		name     string
+		resp     map[string]any
+		path     string
+		wantVal  any
+		wantOK   bool
+	}{
+		{
+			name:    "flat top-level field (e.g. anthropic last_id)",
+			resp:    map[string]any{"last_id": "abc123", "has_more": true},
+			path:    "last_id",
+			wantVal: "abc123",
+			wantOK:  true,
+		},
+		{
+			name:    "nested field (e.g. airtable pagination.next)",
+			resp:    map[string]any{"pagination": map[string]any{"next": "cursor_xyz"}},
+			path:    "pagination.next",
+			wantVal: "cursor_xyz",
+			wantOK:  true,
+		},
+		{
+			name:    "nested field absent - last page",
+			resp:    map[string]any{"pagination": map[string]any{}},
+			path:    "pagination.next",
+			wantVal: nil,
+			wantOK:  false,
+		},
+		{
+			name:    "intermediate segment missing entirely",
+			resp:    map[string]any{"events": []any{}},
+			path:    "pagination.next",
+			wantVal: nil,
+			wantOK:  false,
+		},
+		{
+			name:    "intermediate segment not an object",
+			resp:    map[string]any{"pagination": "not-an-object"},
+			path:    "pagination.next",
+			wantVal: nil,
+			wantOK:  false,
+		},
+		{
+			name:    "deeply nested path",
+			resp:    map[string]any{"a": map[string]any{"b": map[string]any{"c": "deep"}}},
+			path:    "a.b.c",
+			wantVal: "deep",
+			wantOK:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotVal, gotOK := extractPathOK(tt.resp, tt.path)
+			assert.Equal(t, tt.wantOK, gotOK)
+			assert.Equal(t, tt.wantVal, gotVal)
+			assert.Equal(t, tt.wantVal, extractPath(tt.resp, tt.path))
+		})
+	}
+}
+
+func TestCursorPaginatorUpdate_FlatFields(t *testing.T) {
+	// Anthropic-shaped response: flat last_id/has_more, must keep working unchanged.
+	p := &cursorPaginator{nextCursorField: "last_id", hasMoreField: "has_more"}
+
+	hasMore, cursor, err := p.update(map[string]any{"last_id": "page1cursor", "has_more": true})
+	require.NoError(t, err)
+	assert.True(t, hasMore)
+	assert.Equal(t, "page1cursor", cursor)
+
+	hasMore, cursor, err = p.update(map[string]any{"last_id": "", "has_more": false})
+	require.NoError(t, err)
+	assert.False(t, hasMore)
+	assert.Equal(t, "", cursor)
+}
+
+func TestCursorPaginatorUpdate_NestedFieldNoHasMore(t *testing.T) {
+	// Airtable-shaped response: nested pagination.next, no has_more boolean at all.
+	// This is the exact bug that silently dropped ~74% of events: before the fix,
+	// respData["pagination.next"] was always a flat-key miss, so nextCursor was
+	// always "", and pagination stopped after page 1 regardless of real data.
+	p := &cursorPaginator{nextCursorField: "pagination.next"}
+
+	hasMore, cursor, err := p.update(map[string]any{
+		"events":     []any{"e1", "e2"},
+		"pagination": map[string]any{"next": "cursor_page2"},
+	})
+	require.NoError(t, err)
+	assert.True(t, hasMore, "must detect more pages from a nested cursor")
+	assert.Equal(t, "cursor_page2", cursor)
+
+	// Last page: cursor genuinely absent -> must terminate.
+	hasMore, cursor, err = p.update(map[string]any{
+		"events":     []any{"e3"},
+		"pagination": map[string]any{},
+	})
+	require.NoError(t, err)
+	assert.False(t, hasMore, "must terminate when the nested cursor is absent")
+	assert.Equal(t, "", cursor)
+}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	goio "io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/warpstreamlabs/bento/public/service"
@@ -144,11 +145,11 @@ output:
 						Default("after_id"),
 
 					service.NewStringField(hipCursorNextField).
-						Description("JSON path to the next cursor value in the response (e.g., 'last_id', 'next_cursor').").
+						Description("Dot-separated path to the next cursor value in the response (e.g., 'last_id', 'next_cursor', or a nested path like 'pagination.next'). Each segment is a literal object key lookup, not a Bloblang query.").
 						Default("last_id"),
 
 					service.NewStringField(hipCursorHasMoreField).
-						Description("JSON path to a boolean indicating if more pages exist (optional).").
+						Description("Dot-separated path to a boolean indicating if more pages exist (optional). If unset, pagination continues while next_cursor_field resolves to a non-empty value and stops once it's absent or empty — correct for APIs (e.g. Airtable) with no explicit has-more flag.").
 						Default("has_more").
 						Optional(),
 
@@ -189,11 +190,11 @@ output:
 							Default("after_id"),
 
 						service.NewStringField(hipCursorNextField).
-							Description("JSON path to the next cursor value in the response (e.g., 'last_id').").
+							Description("Dot-separated path to the next cursor value in the response (e.g., 'last_id', or a nested path like 'pagination.next').").
 							Default("last_id"),
 
 						service.NewStringField(hipCursorHasMoreField).
-							Description("JSON path to a boolean indicating if more pages exist (optional).").
+							Description("Dot-separated path to a boolean indicating if more pages exist (optional). If unset, pagination continues while next_cursor_field resolves to a non-empty value.").
 							Default("has_more").
 							Optional(),
 					).Description("Optional cursor pagination within each time window. Useful when a single window may contain more records than the page size limit.").
@@ -204,7 +205,7 @@ output:
 
 			service.NewObjectField(hipFieldResponse,
 				service.NewStringField(hipResponseDataField).
-					Description("JSON path to the array of records in the response (e.g., 'data', 'results', 'items'). Use '.' if the response itself is the array.").
+					Description("Dot-separated path to the array of records in the response (e.g., 'data', 'results', 'items', or a nested path). Use '.' if the response itself is the array.").
 					Default("data"),
 
 				service.NewBoolField(hipResponseFlatten).
@@ -687,7 +688,7 @@ func (h *httpPaginatedInput) ReadBatch(ctx context.Context) (service.MessageBatc
 			return nil, nil, fmt.Errorf("failed to parse response as array: %w", err)
 		}
 	} else {
-		dataRaw, ok := respData[h.dataField]
+		dataRaw, ok := extractPathOK(respData, h.dataField)
 		if !ok {
 			return nil, nil, fmt.Errorf("data field %q not found in response", h.dataField)
 		}
@@ -827,12 +828,11 @@ func (p *cursorPaginator) nextURL() string {
 
 func (p *cursorPaginator) update(respData map[string]any) (hasMore bool, nextCursor string, err error) {
 	// Extract next cursor
-	nextCursor, _ = respData[p.nextCursorField].(string)
+	nextCursor, _ = extractPath(respData, p.nextCursorField).(string)
 
 	// Check has_more if field is specified
 	if p.hasMoreField != "" {
-		hasMoreRaw, ok := respData[p.hasMoreField]
-		if ok {
+		if hasMoreRaw, ok := extractPathOK(respData, p.hasMoreField); ok {
 			hasMore, _ = hasMoreRaw.(bool)
 		}
 	} else {
@@ -855,6 +855,34 @@ func containsMiddle(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// extractPath resolves a possibly dot-separated field name against a decoded JSON
+// object, e.g. "pagination.next" walks resp["pagination"]["next"]. A field name with
+// no dots behaves exactly as a flat top-level lookup, so existing configs (e.g.
+// "last_id", "has_more") are unaffected. Returns nil if any segment is missing or not
+// an object.
+func extractPath(resp map[string]any, path string) any {
+	v, _ := extractPathOK(resp, path)
+	return v
+}
+
+// extractPathOK is extractPath but also reports whether the full path resolved, so
+// callers can distinguish "field present but false/empty" from "field missing"
+// (matters for has_more_field, which must only be trusted when actually present).
+func extractPathOK(resp map[string]any, path string) (any, bool) {
+	var cur any = resp
+	for _, part := range strings.Split(path, ".") {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		cur, ok = m[part]
+		if !ok {
+			return nil, false
+		}
+	}
+	return cur, true
 }
 
 //------------------------------------------------------------------------------
@@ -933,12 +961,11 @@ func (p *timeWindowPaginator) update(respData map[string]any) (hasMore bool, nex
 	}
 
 	// Extract next cursor for pagination within window
-	nextCursor, _ = respData[p.nextCursorField].(string)
+	nextCursor, _ = extractPath(respData, p.nextCursorField).(string)
 
 	// Check has_more if field is specified
 	if p.hasMoreField != "" {
-		hasMoreRaw, ok := respData[p.hasMoreField]
-		if ok {
+		if hasMoreRaw, ok := extractPathOK(respData, p.hasMoreField); ok {
 			hasMore, _ = hasMoreRaw.(bool)
 		}
 	} else {
