@@ -106,6 +106,14 @@ func generateStructTypeFromFields(
 
 				components = append(components, fmt.Sprintf("decimal(%d:%d)", scale, precision))
 			}
+
+			if typeStr == "DATE" {
+				components = append(components, "date")
+			}
+
+			if typeStr == "TIMESTAMP_MILLIS" {
+				components = append(components, "timestamp")
+			}
 		}
 
 		if schemaOpts.optionalsAsStructTags {
@@ -287,6 +295,10 @@ func getReflectType(typeStr string) (reflect.Type, error) {
 		return reflect.TypeFor[int32](), nil
 	case "DECIMAL64":
 		return reflect.TypeFor[int64](), nil
+	case "DATE":
+		return reflect.TypeFor[int32](), nil
+	case "TIMESTAMP_MILLIS":
+		return reflect.TypeFor[int64](), nil
 	default:
 		return nil, fmt.Errorf("unsupported type: %s", typeStr)
 	}
@@ -314,10 +326,17 @@ func wrapType(
 				return nil, fmt.Errorf("getting optional flag: %w", err)
 			}
 			if optional {
-				// FIX: Don't wrap LIST types (slices) in pointers
-				// The parquet-go library requires "list" tag on slice types, not pointer types
-				// LIST types already handle nullability through 3-level encoding
-				if baseType.Kind() != reflect.Slice {
+				// Don't wrap LIST types (slices) in pointers: parquet-go requires the "list"
+				// tag on slice types, not pointer types — LIST already handles nullability
+				// via 3-level encoding.
+				//
+				// Don't wrap DATE/TIMESTAMP_MILLIS in pointers either: parquet-go's "date"/
+				// "timestamp" struct tags only accept a pointer for *time.Time, not
+				// *int32/*int64 (case "date"/"timestamp" in parquet-go schema.go panics via
+				// throwInvalidTag for any other Ptr Elem type). Our DATE/TIMESTAMP_MILLIS
+				// tokens keep the underlying value as a plain int32/int64, so optionality is
+				// carried by the "optional" tag component alone (already appended above).
+				if baseType.Kind() != reflect.Slice && !isDateOrTimestampType(field) {
 					return reflect.PointerTo(baseType), nil
 				}
 			}
@@ -325,6 +344,17 @@ func wrapType(
 	}
 
 	return baseType, nil
+}
+
+func isDateOrTimestampType(field *service.ParsedConfig) bool {
+	if !field.Contains("type") {
+		return false
+	}
+	typeStr, err := field.FieldString("type")
+	if err != nil {
+		return false
+	}
+	return typeStr == "DATE" || typeStr == "TIMESTAMP_MILLIS"
 }
 
 func isDeltaLengthByteArrayEncodable(typeStr string) bool {
