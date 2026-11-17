@@ -3,6 +3,7 @@ package io
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	goio "io"
 	"net/http"
@@ -568,7 +569,21 @@ func (h *httpPaginatedInput) Connect(ctx context.Context) error {
 	return nil
 }
 
+// ReadBatch fetches the next page. Any error other than a clean end of input or a cancelled
+// context is treated as terminal: Bento's input read loop logs a read error and then calls
+// ReadBatch again forever (its read backoff never gives up), so without this a persistent failure
+// such as a revoked key (HTTP 401) or a non-JSON body keeps re-requesting until the process is
+// killed. Marking the input done makes the next call return ErrEndOfInput after the error has been
+// logged once, so Bento exits and the caller sees the failure.
 func (h *httpPaginatedInput) ReadBatch(ctx context.Context) (service.MessageBatch, service.AckFunc, error) {
+	batch, ack, err := h.readBatch(ctx)
+	if err != nil && !errors.Is(err, service.ErrEndOfInput) && ctx.Err() == nil {
+		h.done = true
+	}
+	return batch, ack, err
+}
+
+func (h *httpPaginatedInput) readBatch(ctx context.Context) (service.MessageBatch, service.AckFunc, error) {
 	// If we have buffered records, return them
 	if len(h.buffer) > 0 {
 		return h.emitFromBuffer()
