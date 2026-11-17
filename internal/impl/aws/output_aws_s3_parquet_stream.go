@@ -271,13 +271,29 @@ func s3ParquetStreamConfigFromParsed(pConf *service.ParsedConfig) (conf s3Parque
 		}
 	}
 
-	// Generate schema and message types
-	// IMPORTANT: Use the same options for both schema and message types to ensure
-	// consistent definition/repetition level encoding. A mismatch causes
-	// "insufficient definition levels" errors when reading parquet files with
-	// nested optional STRUCT fields.
-	messageType, err := bentop.GenerateStructType(schemaConf, bentop.SchemaOpts{
+	// Generate the schema type and the message type. This mirrors the upstream parquet_encode
+	// processor, which also uses two structs:
+	//
+	//   - schemaType carries optionality in the "optional" struct tag and has no pointers. It is the
+	//     only one passed to parquet.SchemaOf(). parquet-go panics in SchemaOf if a pointer other
+	//     than *time.Time sits under a "timestamp"/"date" tag, which is what every optional
+	//     TIMESTAMP_MILLIS / DATE column (an *int64 / *int32 here) would otherwise be.
+	//   - messageType uses pointers for optionals, so NULLs are representable in the rows we write.
+	//     It is never passed to SchemaOf().
+	//
+	// Writing rows of messageType against a schema built from schemaType is what the upstream
+	// processor does; nested optional STRUCTs are covered by TestS3ParquetStreamOutput_OptionalTimeColumns.
+	schemaType, err := bentop.GenerateStructType(schemaConf, bentop.SchemaOpts{
 		OptionalsAsStructTags: true,
+		OptionalAsPtrs:        false,
+		DefaultEncoding:       defaultEncodingTag,
+	})
+	if err != nil {
+		return conf, fmt.Errorf("failed to generate schema struct: %w", err)
+	}
+
+	messageType, err := bentop.GenerateStructType(schemaConf, bentop.SchemaOpts{
+		OptionalsAsStructTags: false,
 		OptionalAsPtrs:        true,
 		DefaultEncoding:       defaultEncodingTag,
 	})
@@ -285,8 +301,7 @@ func s3ParquetStreamConfigFromParsed(pConf *service.ParsedConfig) (conf s3Parque
 		return conf, fmt.Errorf("failed to generate message struct: %w", err)
 	}
 
-	// Use the same type for both schema and message to ensure consistency
-	conf.Schema = parquet.SchemaOf(reflect.New(messageType).Interface())
+	conf.Schema = parquet.SchemaOf(reflect.New(schemaType).Interface())
 	conf.MessageType = messageType
 
 	// Row group size
